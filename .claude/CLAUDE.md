@@ -180,12 +180,17 @@ dotnet add src/NomeDoProjeto.Worker reference src/MicroservicesAspire.ServiceDef
 # Criar migration
 dotnet ef migrations add MigrationName -p src/Catalog.Api
 
-# Aplicar migration
+# Aplicar migration (APENAS manualmente em staging/produção)
 dotnet ef database update -p src/Catalog.Api
 
 # Remover última migration
 dotnet ef migrations remove -p src/Catalog.Api
 ```
+
+**⚠️ IMPORTANTE: Migrations Automáticas**
+- **Development**: Migrations aplicadas automaticamente na inicialização
+- **Staging/Produção**: Migrations devem ser aplicadas MANUALMENTE
+- Veja [docs/MIGRATIONS.md](../docs/MIGRATIONS.md) para detalhes e boas práticas
 
 ### Executar AppHost
 ```bash

@@ -10,7 +10,10 @@
       "Bash(dotnet workload install:*)",
       "Bash(dotnet sln add:*)",
       "Bash(dotnet add:*)",
-      "Bash(dotnet build)"
+      "Bash(dotnet build)",
+      "Bash(git commit:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet ef migrations add:*)"
     ],
     "deny": [],
     "ask": []
