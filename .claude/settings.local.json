@@ -13,7 +13,8 @@
       "Bash(dotnet build)",
       "Bash(git commit:*)",
       "Bash(dotnet build:*)",
-      "Bash(dotnet ef migrations add:*)"
+      "Bash(dotnet ef migrations add:*)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": []
