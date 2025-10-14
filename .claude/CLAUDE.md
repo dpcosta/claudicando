@@ -87,7 +87,88 @@ public interface IProductRepository
 }
 ```
 
-#### 3. Service Discovery (Orders → Catalog)
+#### 3. Geração de IDs com UUID v7
+
+**IMPORTANTE**: Todos os IDs do tipo `Guid` devem ser gerados usando **UUID v7** (`Guid.CreateVersion7()`).
+
+**Por quê?**
+- ✅ **Ordenação temporal**: UUIDs mantêm ordem cronológica
+- ✅ **Performance**: Índices B-tree mais eficientes que UUIDs aleatórios
+- ✅ **Compatibilidade**: Fallback `NEWSEQUENTIALID()` no SQL Server
+
+**Implementação**:
+
+**a) DbContext - Fallback do banco de dados**:
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.Entity<Product>(entity =>
+    {
+        entity.HasKey(e => e.Id);
+        entity.Property(e => e.Id).HasDefaultValueSql("NEWSEQUENTIALID()");
+        entity.Property(e => e.Name).IsRequired().HasMaxLength(100);
+        // ... outras configurações
+    });
+}
+```
+
+**b) Program.cs / Services - Geração explícita**:
+```csharp
+// ✅ CORRETO - Gerar antes de usar
+var product = new Product
+{
+    Id = Guid.CreateVersion7(),
+    Name = dto.Name,
+    Price = dto.Price,
+    Stock = dto.Stock,
+    CreatedAt = DateTime.UtcNow
+};
+
+await repository.CreateAsync(product);
+
+// ❌ INCORRETO - Não usar Guid.NewGuid()
+var product = new Product
+{
+    Id = Guid.NewGuid(),  // NÃO FAZER!
+    Name = dto.Name,
+    // ...
+};
+```
+
+**c) Quando gerar IDs explicitamente**:
+
+Sempre que o ID precisa ser usado **antes** de `SaveChangesAsync()`:
+
+```csharp
+// Exemplo: Order precisa do ID para o payload da OutboxMessage
+var order = new Order
+{
+    Id = Guid.CreateVersion7(),  // ✅ Gerar aqui
+    UserId = userId,
+    TotalAmount = total,
+    Items = items
+};
+
+dbContext.Orders.Add(order);
+
+// Usar order.Id no payload (já tem valor correto)
+var outboxMessage = new OutboxMessage
+{
+    Id = Guid.CreateVersion7(),
+    EventType = "OrderCreated",
+    Payload = JsonSerializer.Serialize(new { OrderId = order.Id })  // ✅ ID já existe
+};
+
+dbContext.OutboxMessages.Add(outboxMessage);
+await dbContext.SaveChangesAsync();
+```
+
+**Regra geral**:
+- ✅ **Gere explicitamente** se o ID é usado em logs, payloads, chaves ou antes de persistir
+- ✅ **Sempre use** `Guid.CreateVersion7()` (nunca `Guid.NewGuid()`)
+- ✅ **Mantenha** `NEWSEQUENTIALID()` no DbContext como fallback
+
+#### 4. Service Discovery (Orders → Catalog)
 ```csharp
 // Program.cs do Orders.Api
 builder.Services.AddHttpClient<ICatalogService>((serviceProvider, client) =>
@@ -99,7 +180,7 @@ builder.Services.AddHttpClient<ICatalogService>((serviceProvider, client) =>
 });
 ```
 
-#### 4. Configuração no Program.cs
+#### 5. Configuração no Program.cs
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
 
