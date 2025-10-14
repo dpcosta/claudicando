@@ -21,13 +21,15 @@ Este documento descreve o plano detalhado para implementar um sistema completo d
     ┌─────▼─────┐      ┌─────▼─────┐      ┌─────┴─────┐
     │SQL Server │      │SQL Server │      │ RabbitMQ  │
     │(CatalogDb)│      │ (OrdersDb)│      └───────────┘
-    └───────────┘      └───────────┘
-          │
-    ┌─────▼─────┐
-    │   Redis   │
+    └───────────┘      │ - Orders  │            ▲
+          │            │ - Outbox  │◄───────────┘
+    ┌─────▼─────┐      └───────────┘     Outbox Processor
+    │   Redis   │            (Background Service)
     │  (Cache)  │
     └───────────┘
 ```
+
+**Padrão Outbox**: O Orders.Api utiliza o padrão Transactional Outbox para garantir consistência entre a criação de pedidos e o envio de eventos. Mensagens são salvas na tabela Outbox na mesma transação do pedido, e um background service (Outbox Processor) processa e publica os eventos no RabbitMQ de forma assíncrona e confiável.
 
 ## Fase 1: Inicialização do Repositório Git
 
@@ -162,7 +164,7 @@ claudicando/
 
 ---
 
-## Fase 4: Microserviço Orders.Api
+## Fase 4: Microserviço Orders.Api (com Padrão Outbox)
 
 ### Tarefas:
 
@@ -183,14 +185,15 @@ claudicando/
 3. **Implementar Camadas:**
    - **Entities**: Order (Id, UserId, Items, TotalAmount, CreatedAt, Status)
    - **Entities**: OrderItem (Id, OrderId, ProductId, ProductName, Quantity, Price)
+   - **Entities**: OutboxMessage (Id, EventType, Payload, CreatedAt, ProcessedAt, IsProcessed)
    - **DTOs**: OrderDto, CreateOrderDto, OrderItemDto (record types)
-   - **DbContext**: OrdersDbContext
+   - **DbContext**: OrdersDbContext (incluir DbSet<OutboxMessage>)
    - **Repository**: IOrderRepository, OrderRepository
-   - **Services**: ICatalogService (HttpClient), IRabbitMqPublisher
+   - **Services**: ICatalogService (HttpClient)
    - **Validators**: CreateOrderValidator
 
 4. **Implementar Endpoints (Minimal APIs):**
-   - `POST /api/orders` - Cria pedido
+   - `POST /api/orders` - Cria pedido e salva evento na Outbox (transação única)
    - `GET /api/orders/{id}` - Consulta pedido
    - `GET /api/orders` - Lista pedidos (query: userId)
 
@@ -199,25 +202,150 @@ claudicando/
    - Validar produtos antes de criar pedido
    - Verificar stock disponível
 
-6. **RabbitMQ Integration:**
-   - Publicar evento `OrderCreated` após criação do pedido
-   - Payload: { OrderId, UserId, Items[], TotalAmount, CreatedAt }
+6. **Padrão Outbox (Transactional Outbox Pattern):**
+   - Criar entidade `OutboxMessage` com campos:
+     - `Id` (Guid, PK)
+     - `EventType` (string, ex: "OrderCreated")
+     - `Payload` (string, JSON serializado)
+     - `CreatedAt` (DateTime)
+     - `ProcessedAt` (DateTime?)
+     - `IsProcessed` (bool, default: false)
+   - No endpoint `POST /api/orders`:
+     - Iniciar transação do EF Core
+     - Salvar Order e OrderItems
+     - Criar e salvar OutboxMessage com evento `OrderCreated`
+     - Commit da transação (garante atomicidade)
+   - **NÃO** publicar diretamente no RabbitMQ no endpoint
 
 7. **Migrations:**
    ```bash
    dotnet ef migrations add InitialCreate -p src/Orders.Api
-   dotnet ef database update -p src/Orders.Api
    ```
+   A migration deve incluir tabelas: Orders, OrderItems e OutboxMessages
 
 ### Entregáveis:
-- Orders.Api funcional
+- Orders.Api funcional com padrão Outbox
 - Integração com Catalog.Api via Service Discovery
-- Publicação de eventos no RabbitMQ
 - Validação de produtos
+- Eventos salvos na tabela Outbox (transação ACID)
+- **Observação**: Eventos ainda não são publicados no RabbitMQ (isso será feito na Fase 4.5)
 
 ---
 
-## Fase 5: Worker Notifications.Worker
+## Fase 4.5: Outbox Processor (Background Service)
+
+### Tarefas:
+
+1. **Criar Background Service no Orders.Api:**
+   ```bash
+   # Criar classe OutboxProcessor.cs na pasta Services/
+   ```
+
+2. **Implementar OutboxProcessor:**
+   - Herdar de `BackgroundService`
+   - Executar em loop contínuo (intervalo configurável, ex: 5 segundos)
+   - Lógica do processamento:
+     - Buscar mensagens não processadas (`IsProcessed = false`)
+     - Ordenar por `CreatedAt` (FIFO)
+     - Limitar quantidade por batch (ex: 10 mensagens)
+     - Para cada mensagem:
+       - Publicar no RabbitMQ
+       - Se sucesso: marcar `IsProcessed = true`, `ProcessedAt = DateTime.UtcNow`
+       - Se falha: logar erro e continuar (retry na próxima execução)
+
+3. **Implementar RabbitMQ Publisher:**
+   - Criar `IRabbitMqPublisher` e `RabbitMqPublisher`
+   - Métodos: `PublishAsync(string eventType, string payload)`
+   - Configuração de conexão via appsettings/Aspire
+   - Tratamento de erros e reconexão
+
+4. **Configurações:**
+   - Registrar `OutboxProcessor` como Hosted Service:
+     ```csharp
+     builder.Services.AddHostedService<OutboxProcessor>();
+     ```
+   - Configurar intervalo de processamento (appsettings.json):
+     ```json
+     "OutboxProcessor": {
+       "IntervalSeconds": 5,
+       "BatchSize": 10
+     }
+     ```
+
+5. **Idempotência e Atomicidade:**
+   - Usar transação ao marcar mensagem como processada
+   - Garantir que a mesma mensagem não seja publicada duas vezes
+   - Implementar retry com backoff exponencial (opcional)
+
+6. **Logging e Observabilidade:**
+   - Logar início/fim do processamento de cada batch
+   - Logar erros de publicação com detalhes
+   - Métricas: mensagens processadas, erros, latência
+
+7. **Health Check:**
+   - Adicionar health check para RabbitMQ
+   - Monitorar se o processador está ativo
+
+### Implementação Exemplo:
+
+```csharp
+public class OutboxProcessor : BackgroundService
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<OutboxProcessor> _logger;
+    private readonly int _intervalSeconds;
+    private readonly int _batchSize;
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var scope = _serviceProvider.CreateScope();
+                var dbContext = scope.ServiceProvider.GetRequiredService<OrdersDbContext>();
+                var publisher = scope.ServiceProvider.GetRequiredService<IRabbitMqPublisher>();
+
+                var messages = await dbContext.OutboxMessages
+                    .Where(m => !m.IsProcessed)
+                    .OrderBy(m => m.CreatedAt)
+                    .Take(_batchSize)
+                    .ToListAsync(stoppingToken);
+
+                foreach (var message in messages)
+                {
+                    await publisher.PublishAsync(message.EventType, message.Payload);
+
+                    message.IsProcessed = true;
+                    message.ProcessedAt = DateTime.UtcNow;
+                }
+
+                await dbContext.SaveChangesAsync(stoppingToken);
+
+                _logger.LogInformation("Processed {Count} outbox messages", messages.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing outbox messages");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(_intervalSeconds), stoppingToken);
+        }
+    }
+}
+```
+
+### Entregáveis:
+- OutboxProcessor funcional como Background Service
+- Publicação confiável de eventos no RabbitMQ
+- Retry automático em caso de falhas
+- Idempotência no processamento
+- Logging e observabilidade completos
+- Health check para RabbitMQ
+
+---
+
+## Fase 5: Worker Notifications.Worker (com Idempotência)
 
 ### Tarefas:
 
@@ -230,21 +358,70 @@ claudicando/
 
 2. **Adicionar Pacotes NuGet:**
    - RabbitMQ.Client
+   - Microsoft.Extensions.Caching.Memory (para controle de duplicatas)
 
-3. **Implementar Consumer:**
+3. **Implementar Consumer com Idempotência:**
    - Background Service que consome fila do RabbitMQ
    - Processa eventos `OrderCreated`
+   - **Idempotência**: Garantir que a mesma mensagem não seja processada duas vezes
+     - Opção 1: Cache em memória de OrderIds processados (TTL de 1 hora)
+     - Opção 2: Tabela de eventos processados no banco (mais robusto)
+     - Verificar se OrderId já foi processado antes de executar a lógica
    - Loga notificação estruturada (simulação)
+   - Fazer acknowledge (ACK) da mensagem apenas após processamento bem-sucedido
 
 4. **Logging:**
    - Usar Serilog para logs estruturados
    - Incluir OrderId, UserId, TotalAmount nos logs
    - Log levels apropriados (Information para sucesso, Error para falhas)
+   - Logar mensagens duplicadas (já processadas) como Warning
+
+5. **Tratamento de Erros:**
+   - Implementar retry com backoff exponencial
+   - Dead Letter Queue para mensagens com falha após N tentativas
+   - Logar erros detalhados para troubleshooting
+
+### Implementação Exemplo (Idempotência com Cache):
+
+```csharp
+public class NotificationConsumer : BackgroundService
+{
+    private readonly IMemoryCache _cache;
+    private readonly ILogger<NotificationConsumer> _logger;
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Conectar ao RabbitMQ e consumir eventos OrderCreated
+        var message = ConsumeFromQueue(); // Deserializar JSON
+
+        var orderId = message.OrderId;
+
+        // Verificar se já foi processado (idempotência)
+        if (_cache.TryGetValue($"processed:{orderId}", out _))
+        {
+            _logger.LogWarning("Order {OrderId} already processed, skipping", orderId);
+            channel.BasicAck(deliveryTag, false);
+            return;
+        }
+
+        // Processar notificação
+        _logger.LogInformation("Processing notification for Order {OrderId}", orderId);
+
+        // Marcar como processado (TTL de 1 hora)
+        _cache.Set($"processed:{orderId}", true, TimeSpan.FromHours(1));
+
+        // ACK apenas após sucesso
+        channel.BasicAck(deliveryTag, false);
+    }
+}
+```
 
 ### Entregáveis:
 - Worker funcional consumindo RabbitMQ
+- Idempotência implementada (sem processamento duplicado)
 - Logging estruturado
-- Tratamento de erros e retry
+- Tratamento de erros com retry
+- ACK apenas após sucesso
 
 ---
 
@@ -436,6 +613,12 @@ Content-Type: application/json
 ### Validação:
 - FluentValidation
 
+### Mensageria e Padrões:
+- Transactional Outbox Pattern
+- Background Services (Hosted Services)
+- At-Least-Once Delivery
+- Idempotência (Memory Cache / Database)
+
 ### Observabilidade:
 - Aspire Dashboard
 - OpenTelemetry (Traces, Metrics, Logs)
@@ -455,6 +638,10 @@ Content-Type: application/json
 8. **CORS**: Configuração apropriada para ambiente de desenvolvimento
 9. **Error Handling**: Tratamento centralizado de erros
 10. **OpenTelemetry**: Observabilidade distribuída
+11. **Transactional Outbox Pattern**: Consistência entre persistência de dados e publicação de eventos
+12. **Idempotência**: Processamento seguro de mensagens duplicadas
+13. **At-Least-Once Delivery**: Garantia de entrega de eventos com retry automático
+14. **Background Processing**: Processamento assíncrono de eventos desacoplado da API
 
 ---
 
@@ -465,12 +652,20 @@ Content-Type: application/json
 | Fase 1: Git Init | 5 min | Baixa |
 | Fase 2: Aspire Base | 15 min | Média |
 | Fase 3: Catalog.Api | 45 min | Alta |
-| Fase 4: Orders.Api | 60 min | Alta |
-| Fase 5: Notifications.Worker | 30 min | Média |
+| Fase 4: Orders.Api (com Outbox) | 75 min | Alta |
+| Fase 4.5: Outbox Processor | 25 min | Média-Alta |
+| Fase 5: Notifications.Worker (com Idempotência) | 35 min | Média-Alta |
 | Fase 6: AppHost Config | 20 min | Média |
 | Fase 7: Documentação | 30 min | Baixa |
-| Fase 8: Testes | 20 min | Média |
-| **TOTAL** | **~3.5 horas** | - |
+| Fase 8: Testes | 25 min | Média |
+| **TOTAL** | **~4.25 horas** | - |
+
+### Notas sobre Cronograma:
+- **Fase 4**: +15 min para implementar tabela Outbox e lógica transacional
+- **Fase 4.5 (Nova)**: +25 min para implementar Background Service de processamento
+- **Fase 5**: +5 min para implementar idempotência no consumer
+- **Fase 8**: +5 min para testar cenários do padrão Outbox
+- **Complexidade aumentada**: O padrão Outbox adiciona complexidade, mas garante consistência transacional
 
 ---
 
