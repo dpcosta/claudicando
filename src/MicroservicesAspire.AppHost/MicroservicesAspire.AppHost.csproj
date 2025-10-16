@@ -19,6 +19,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Catalog.Api\Catalog.Api.csproj" />
     <ProjectReference Include="..\Orders.Api\Orders.Api.csproj" />
+    <ProjectReference Include="..\Web.Blazor\Web.Blazor.csproj" />
   </ItemGroup>
 
 </Project>

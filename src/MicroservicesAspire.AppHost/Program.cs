@@ -29,4 +29,8 @@ var ordersApi = builder.AddProject<Projects.Orders_Api>("orders-api")
     .WaitFor(rabbitMq)
     .WaitFor(catalogApi);
 
+var webBlazor = builder.AddProject<Projects.Web_Blazor>("web-blazor")
+    .WithReference(catalogApi)
+    .WaitFor(catalogApi);
+
 builder.Build().Run();
