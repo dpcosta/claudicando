@@ -28,6 +28,12 @@ builder.Services.AddHttpClient<ICatalogService, CatalogService>(client =>
 // Add validators
 builder.Services.AddValidatorsFromAssemblyContaining<CreateOrderValidator>();
 
+// Add RabbitMQ Publisher (Singleton para gerenciar conexão)
+builder.Services.AddSingleton<IRabbitMqPublisher, RabbitMqPublisher>();
+
+// Add Outbox Processor (Background Service)
+builder.Services.AddHostedService<OutboxProcessor>();
+
 // Add Swagger/OpenAPI
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
@@ -45,6 +51,11 @@ builder.Services.AddCors(options =>
               .AllowAnyHeader();
     });
 });
+
+// Add Health Checks
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<OrdersDbContext>("database")
+    .AddRabbitMQ(name: "rabbitmq");
 
 var app = builder.Build();
 
